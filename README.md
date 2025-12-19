@@ -14,16 +14,27 @@ The project compares classical statistical methods with modern machine learning 
 
 ## Data
 
-- Shot-level NBA data covering Kobe Bryant’s career  
-- Binary response variable: `shot_made_flag` (Made / Miss)  
+- Kobe Bryant Dataset is based on his entire 20 year NBA career from 1996-2016
+- The original dataset downloaded from Kaggle contains **30,697 observations and 25 variables**
+- Shot attempts with missing shot outcomes (`shot_made_flag = NA`) were removed prior to modelling, as these observations cannot be used for supervised classification
+- Several redundant or non-informative variables from the raw Kaggle dataset were removed during preprocessing
+- All plots provided in this repository were generated using R
 
-**Key predictors include:**
-- Spatial location (`loc_x`, `loc_y`, `shot_zone_basic`)
-- Temporal context (`minutes_remaining`, `seconds_remaining`, `period`)
-- Shot characteristics (`shot_distance`, `shot_type`, `combined_shot_type`)
-- Game context (`playoffs`, `clutch`)
+---
 
-Missing shot outcomes were removed prior to modelling.
+## Contents
+
+- 5-slide presentation (excluding cover slide)
+- 10-page written report (excluding cover page and table of contents)
+- All models produced by R
+- Kobe Bryant Dataset from Kaggle
+---
+
+## Author
+
+**Danny Gomes**  
+
+
 
 ---
 
@@ -32,7 +43,6 @@ Missing shot outcomes were removed prior to modelling.
 - Stratified 70/30 train–test split
 - 5-fold cross-validation on training data
 - Continuous predictors standardised using training data only
-- Models evaluated using ROC curves and AUC, rather than accuracy alone, due to class imbalance
 
 ---
 
@@ -42,6 +52,21 @@ Missing shot outcomes were removed prior to modelling.
 - Random Forest
 - Support Vector Machine (Radial Kernel)
 - Deep Learning (H2O)
+
+---
+
+## Model Interpretation
+
+- Logistic regression coefficients and odds ratios were examined to assess effect size and direction
+- Variable importance from tree-based models was used to identify dominant predictors
+
+---
+
+## Evaluation
+
+- Model performance is primarily assessed using AUC (ROC)
+- Accuracy, sensitivity, and specificity are reported for interpretability
+- AUC was chosen due to class imbalance and threshold dependence of accuracy
 
 ---
 
@@ -60,6 +85,13 @@ Missing shot outcomes were removed prior to modelling.
 - Variable importance analysis shows shot difficulty and location dominate prediction
 - Performance is limited by missing contextual information (e.g. defender proximity)
 
+  ## Limitations
+
+- Defensive pressure and player-tracking data are not available
+- Shot success contains inherent randomness beyond observable features
+- Results should be interpreted as conditional on the available shot-level information
+
+
   ## How to Run the Code
   
  Install and load the required packages:
@@ -75,8 +107,12 @@ library(cowplot)
 ```
 Notes
 
--Results are reproducible using the provided random seeds
+- Random seeds are set to ensure reproducible results
+  
+- All models were trained and evaluated using the same train–test split
+  
+- Deep learning model was fitted using the H2O framework
 
--Model performance is reported on a held-out test set
+- Model performance is reported on a held-out test set
 
--The focus of the project is model understanding, not maximising predictive accuracy
+- The focus of the project is model understanding, not maximising predictive accuracy

@@ -1,0 +1,703 @@
+---
+title: "Final Project NBA KOBE BRYANT SHOTS"
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)     # Data manipulation and visualisation
+library(caret)         # Model evaluation and confusion matrices
+library(e1071)         # Support Vector Machines
+library(randomForest)  # Random Forest models
+library(pROC)          # ROC curves and AUC
+library(h2o)           # Deep learning models
+library(cowplot)       # Plot arrangement
+```
+
+#Sorting the Data
+```{r}
+shots <- read.csv("D:/Downloads/Kobe Bryant Shots Final Project/Kobe_data.csv")
+dim(shots)        # rows × columns
+str(shots)        # variable types
+summary(shots)    # missing values + distributions
+
+
+# Checking for NA values (overall)
+sum(is.na(shots))
+# Checking which columns contain NA values
+colSums(is.na(shots))
+# Removing rows with missing response variable
+shots <- shots %>% drop_na(shot_made_flag)
+
+# convert useful categories
+shots$season <- factor(shots$season)
+shots$playoffs <- factor(shots$playoffs, levels = c(0,1), labels = c("Regular", "Playoff"))
+shots$shot_zone_basic <- factor(shots$shot_zone_basic)
+shots$shot_zone_range <- factor(shots$shot_zone_range)
+shots$shot_zone_area  <- factor(shots$shot_zone_area)
+shots$opponent <- factor(shots$opponent)
+# Create clutch while period is still numeric
+shots$clutch <- factor(ifelse(shots$period >= 4 & shots$minutes_remaining <= 2, "Clutch", "NonClutch"), levels = c("NonClutch", "Clutch"))
+#Then make the period a category
+shots$period <- factor(shots$period)
+
+# simplify shot_type (2PT vs 3PT)
+shots$shot_type <- factor(ifelse(grepl("3PT", shots$shot_type), "3PT", "2PT"))
+#Use Combined Shot Type instead of Shot type 
+shots$combined_shot_type <- factor(shots$combined_shot_type)
+shots$action_type <- NULL
+
+#drop ID or constants that don't generalize
+shots$team_name <- NULL
+shots$team_id <- NULL
+shots$shot_id <- NULL
+shots$game_id <- NULL
+shots$game_event_id <- NULL
+#Keep loc_x, loc_y instead
+shots$lat <- NULL
+shots$lon <- NULL
+
+
+model_data <- shots[, c("shot_made_flag","shot_distance","loc_x","loc_y","minutes_remaining","seconds_remaining","period","playoffs","shot_type","combined_shot_type","shot_zone_basic","clutch")]
+anyNA(model_data) # confirm no missing values in modelling set
+
+#Model as 'miss' or 'made'
+model_data$shot_made_flag <- factor(ifelse(model_data$shot_made_flag == 1, "Made", "Miss"),
+levels = c("Miss", "Made"))
+
+dim(model_data)
+str(model_data)
+#Check proportion of Field Goal 
+prop.table(table(model_data$shot_made_flag))
+levels(model_data$shot_made_flag) 
+
+```
+
+#EDA
+```{r}
+# -----------------------------------------
+# EDA 1: Shot distance vs shot success
+model_data %>%
+mutate(distance_zone = case_when(
+shot_distance <= 8  ~ "0–8 ft (Paint)",
+shot_distance <= 16 ~ "8–16 ft",
+shot_distance <= 24 ~ "16–24 ft",
+TRUE                ~ "24+ ft (3PT)")) %>%
+ggplot(aes(x = distance_zone, fill = shot_made_flag)) +
+geom_bar(position = "fill") +
+labs(
+y = "Proportion",
+x = "Shot distance zone",
+title = "Shot success by distance zone") +theme_bw()
+
+
+# -----------------------------------------
+# EDA 2: Shot type (2PT vs 3PT) vs success
+ggplot(model_data, aes(x = shot_type, fill = shot_made_flag)) +
+geom_bar(position = "fill") +
+labs(y = "Proportion",title = "Shot success by shot type",x = "Shot type") +theme_bw()
+
+
+# -----------------------------------------
+# EDA 3: Shot mechanics vs success
+ggplot(model_data, aes(x = combined_shot_type, fill = shot_made_flag)) +
+geom_bar(position = "fill") +
+coord_flip() +
+labs(
+y = "Proportion",
+title = "Shot success by shot mechanics",
+x = "Shot mechanics") +theme_bw()
+
+
+# -----------------------------------------
+# EDA 4: Frequency check for shot mechanics
+table(model_data$combined_shot_type)
+#all shot types have >100 observations so keep
+
+```
+#Heatmap (EDA graph 5)
+```{r}
+# Transform coordinates + half-court window
+kobe <- model_data %>%
+mutate(
+x = as.numeric(loc_x) / 10 * -1,
+y = as.numeric(loc_y) / 10 + 5.25
+) %>%
+filter(x >= -27.5, x <= 27.5, y >= 0, y <= 45)
+
+# outside paint (exclude key region)
+kobe_nonpaint <- kobe %>% filter(!(abs(x) <= 8 & y <= 19))
+
+# Court styling
+court_themes <- list(
+ppt = list(
+court = "gray15",
+lines = "white",
+text  = "#f0f0f0"))
+
+circle_points <- function(center = c(0, 0), radius = 1, npoints = 360) {
+angles <- seq(0, 2 * pi, length.out = npoints)
+tibble(
+x = center[1] + radius * cos(angles),
+y = center[2] + radius * sin(angles))}
+
+plot_court <- function(court_theme = court_themes$ppt) {
+
+court <- tibble(
+x = c(25, 25, -25, -25, 25),
+y = c(47, 0, 0, 47, 47),
+desc = "perimeter"
+  ) %>%
+bind_rows(tibble(x = c(8, 8, -8, -8), y = c(0, 19, 19, 0), desc = "key")) %>%
+bind_rows(tibble(x = c(-3, 3), y = c(4, 4), desc = "backboard")) %>%
+bind_rows(tibble(x = c(0, 0), y = c(4, 5.5), desc = "neck")) %>%
+bind_rows(circle_points(c(0, 19), 6) %>% mutate(desc = "foul_circle_top")) %>%
+bind_rows(circle_points(c(0, 5.25), 0.75) %>% mutate(desc = "hoop")) %>%
+bind_rows(circle_points(c(0, 5.25), 4) %>% filter(y >= 5.25) %>% mutate(desc = "restricted")) %>%
+bind_rows({arc <- circle_points(c(0, 5.25), 23.75) %>% filter(y >= 14)
+tibble(
+x = c(22, 22, arc$x, -22, -22),
+y = c(0, 14, arc$y, 14, 0),
+desc = "three_point_line")})
+  
+ggplot() + geom_path(data = court, aes(x = x, y = y, group = desc), color = court_theme$lines) + coord_fixed(ylim = c(0, 45), xlim = c(-25, 25)) + theme_minimal(base_size = 22) + theme(text = element_text(color = court_theme$text),
+plot.background  = element_rect(fill = "gray15", color = "gray15"),
+panel.background = element_rect(fill = court_theme$court, color = court_theme$court),
+panel.grid = element_blank(),
+panel.border = element_blank(),
+axis.text  = element_blank(),
+axis.title = element_blank(),
+axis.ticks = element_blank(),
+legend.position = "none")}
+
+# Palette
+palette <- paletteer::paletteer_d("RColorBrewer::YlOrRd", direction = -1)
+
+# Build heatmaps (same geoms + same styling) ---
+heatmap_all <- plot_court(court_themes$ppt) +
+geom_density_2d_filled(data = kobe, mapping = aes(x = x, y = y, fill = after_stat(level)), contour_var = "ndensity", breaks = seq(0.1, 1.0, length.out = 10), alpha = 0.6) + scale_fill_manual(values = palette, aesthetics = c("fill", "color")) +
+scale_x_continuous(limits = c(-27.5, 27.5)) +
+scale_y_continuous(limits = c(0, 45)) +
+labs(title = "Kobe Shot Heatmap",
+subtitle = "All shots",
+caption = "Lighter colors indicate higher shot frequency") + theme(plot.title    = element_text(hjust = 0.5, size = 22, face = "bold", vjust = -4, color = "white"),
+plot.subtitle = element_text(hjust = 0.5, size = 12, face = "bold", vjust = -8, color = "white"),
+plot.caption  = element_text(hjust = 0.5, size = 8,  color = "lightgrey", vjust = 8))
+
+heatmap_outside_paint <- plot_court(court_themes$ppt) +
+geom_density_2d_filled(data = kobe_nonpaint,
+mapping = aes(x = x, y = y, fill = after_stat(level)),
+contour_var = "ndensity",
+breaks = seq(0.1, 1.0, length.out = 10), alpha = 0.6) + scale_fill_manual(values = palette, aesthetics = c("fill", "color")) +
+scale_x_continuous(limits = c(-27.5, 27.5)) +
+scale_y_continuous(limits = c(0, 45)) +
+labs(title = "Kobe Shot Heatmap", subtitle = "Outside the paint", caption = "Paint/key excluded to highlight lower-frequency areas") +
+theme(
+plot.title    = element_text(hjust = 0.5, size = 22, face = "bold", vjust = -4, color = "white"),
+plot.subtitle = element_text(hjust = 0.5, size = 12, face = "bold", vjust = -8, color = "white"),
+plot.caption  = element_text(hjust = 0.5, size = 8,  color = "lightgrey", vjust = 8))
+
+# Side-by-side
+plot_grid(
+  ggdraw(heatmap_all) + theme(plot.background = element_rect(fill = "gray15", color = NA)),
+  ggdraw(heatmap_outside_paint) + theme(plot.background = element_rect(fill = "gray15", color = NA)),
+  nrow = 1,
+  labels = c("A", "B"),
+  label_colour = "white",
+  label_size = 16
+)
+
+
+```
+
+#Splitting/Training and Scaling the data
+```{r}
+# Train/test split (stratified to preserve class balance) ---
+set.seed(123)  # reproducibility (same split every knit)
+
+train_index <- train_index <- createDataPartition(model_data$shot_made_flag, p = 0.70, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data  <- model_data[-train_index, ]
+
+# Confirm split sizes
+dim(train_data)
+dim(test_data)
+
+# Confirm class balance is similar in both sets (no accidental skew)
+prop.table(table(train_data$shot_made_flag))
+prop.table(table(test_data$shot_made_flag))
+
+#Cross-validation setup (for later model tuning/comparison) ---
+ctrl <- trainControl(
+method = "cv",            # k-fold cross validation
+number = 5,               # 5 folds (good trade-off for runtime)
+classProbs = TRUE,        # needed for ROC/AUC
+summaryFunction = twoClassSummary,  # enables ROC metric in caret
+savePredictions = "final" # keeps CV preds for inspection if needed
+)
+
+#Define the positive class for ROC/AUC as "Made" ---
+train_data$shot_made_flag <- factor(train_data$shot_made_flag, levels = c("Miss","Made"))
+test_data$shot_made_flag  <- factor(test_data$shot_made_flag,  levels = c("Miss","Made"))
+
+#Confirm new order (Made first, then Miss)
+levels(train_data$shot_made_flag)
+
+#Scale numeric predictors (train stats only to prevents leakage) ---
+num_cols <- c("shot_distance", "loc_x", "loc_y", "minutes_remaining", "seconds_remaining")
+
+# Fit scaling on training data only
+pp <- preProcess(train_data[, num_cols], method = c("center", "scale"))
+
+# Apply to both sets
+train_data_scaled <- train_data
+test_data_scaled  <- test_data
+
+train_data_scaled[, num_cols] <- predict(pp, train_data[, num_cols])
+test_data_scaled[, num_cols]  <- predict(pp, test_data[, num_cols])
+
+# Quick check: should be ~0 mean / ~1 sd in training
+summary(train_data_scaled[, num_cols])
+
+#Create an explicit numeric outcome for GLM (removes factor-level ambiguity)
+train_data_scaled <- train_data_scaled %>%
+  mutate(made01 = ifelse(shot_made_flag == "Made", 1, 0))
+
+test_data_scaled <- test_data_scaled %>%
+  mutate(made01 = ifelse(shot_made_flag == "Made", 1, 0))
+
+
+```
+
+
+
+#Logistic Modelling
+```{r}
+# Fit logistic regression (Made is the "case" if levels are c("Miss","Made"))
+glm_fit <- glm(
+  shot_made_flag ~ shot_distance + loc_x + loc_y +
+    minutes_remaining + seconds_remaining +
+    period + playoffs + shot_type + combined_shot_type +
+    shot_zone_basic + clutch,
+  data = train_data_scaled,
+  family = binomial
+) # fit model
+summary(glm_fit) # inspect coefficients
+
+# Predict P(Made) on test set
+glm_prob <- predict(glm_fit, newdata = test_data_scaled, type = "response") # probabilities
+
+# Baseline 0.50 threshold classification
+glm_pred_05 <- factor(ifelse(glm_prob >= 0.5, "Made", "Miss"),
+                      levels = levels(test_data_scaled$shot_made_flag)) # same level order
+cm_05 <- confusionMatrix(glm_pred_05, test_data_scaled$shot_made_flag, positive = "Made") # confusion matrix
+cm_05
+
+# ROC + AUC (use direction="<" when higher prob means "Made")
+roc_obj <- pROC::roc(
+  response  = test_data_scaled$shot_made_flag,
+  predictor = glm_prob,
+  levels    = c("Miss", "Made"),  # control then case
+  direction = "<",                # prob(Made) should be higher for "Made"
+  quiet     = TRUE
+) # ROC object
+
+auc_val <- as.numeric(pROC::auc(roc_obj)) # AUC value
+auc_val
+
+plot(roc_obj,
+     main = paste0("ROC Curve - Logistic Regression (AUC = ", round(auc_val, 3), ")"),
+     legacy.axes = TRUE,
+     xlab = "False Positive Rate (1 - Specificity)",
+     ylab = "True Positive Rate (Sensitivity)") # ROC plot
+abline(a = 0, b = 1, lty = 2) # diagonal reference
+
+# Optimal threshold (Youden’s J)
+opt <- pROC::coords(
+roc_obj,
+x = "best",
+best.method = "youden",
+ret = c("threshold", "sensitivity", "specificity"),
+transpose = FALSE
+) # returns either numeric vector or list depending on pROC version
+
+opt # view threshold + sens + spec
+opt_t <- if (is.list(opt)) as.numeric(opt$threshold) else as.numeric(opt["threshold"])
+
+glm_pred_opt <- factor(ifelse(glm_prob >= opt_t, "Made", "Miss"),
+                       levels = c("Miss","Made"))
+cm_opt <- confusionMatrix(glm_pred_opt, test_data_scaled$shot_made_flag, positive="Made")
+
+
+# Permutation importance (drop in AUC when a predictor is shuffled)
+set.seed(123) # reproducibility for permutation
+
+base_auc <- as.numeric(pROC::auc(roc_obj)) # baseline AUC
+vars <- attr(terms(glm_fit), "term.labels") # predictors in the GLM (safe extraction)
+
+perm_imp <- lapply(vars, function(v) {
+tmp <- test_data_scaled # copy test data
+tmp[[v]] <- tmp[[v]][sample.int(nrow(tmp))] # permute one predictor
+prob <- predict(glm_fit, newdata = tmp, type = "response") # new probs
+auc_v <- as.numeric(pROC::auc(pROC::roc(
+response  = test_data_scaled$shot_made_flag,
+predictor = prob,
+levels    = c("Miss", "Made"),
+direction = "<",
+quiet     = TRUE
+))) # AUC after permutation
+data.frame(variable = v, auc_drop = base_auc - auc_v) # importance = drop in AUC
+}) %>% bind_rows() %>% arrange(desc(auc_drop)) # combine + sort
+
+perm_imp # table of importances
+
+ggplot(perm_imp, aes(x = reorder(variable, auc_drop), y = auc_drop)) +
+geom_col() +
+coord_flip() +
+labs(title = "GLM Permutation Importance (Drop in AUC)",
+x = "Predictor",
+y = "AUC drop") # importance plot
+
+# Odds ratios and 95% confidence intervals
+or_table <- broom::tidy(glm_fit, conf.int = TRUE, exponentiate = TRUE)
+
+or_table %>%
+arrange(desc(abs(log(estimate))))  # sort by effect size 
+
+or_table %>%
+filter(term != "(Intercept)") %>%
+ggplot(aes(x = reorder(term, estimate), y = estimate)) +
+geom_point() +
+geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+geom_hline(yintercept = 1, linetype = 2) +
+coord_flip() +
+labs(
+title = "Logistic Regression Odds Ratios (95% CI)",
+x = "Predictor",
+y = "Odds Ratio")
+
+# Store GLM performance metrics
+glm_results <- data.frame(
+  Model       = "Logistic Regression (GLM)",
+  Accuracy    = cm_opt$overall["Accuracy"],
+  Sensitivity = cm_opt$byClass["Sensitivity"],
+  Specificity = cm_opt$byClass["Specificity"],
+  AUC         = auc_val
+)
+
+glm_results
+
+```
+
+#Random Forest
+```{r}
+set.seed(123)  # reproducibility
+
+#checks: factor levels and class balance 
+levels(train_data_scaled$shot_made_flag)   # should be c("Made","Miss") or c("Miss","Made") consistently
+prop.table(table(train_data_scaled$shot_made_flag))  # baseline class rate (NIR context)
+
+# Fit RF on training data only 
+rf_fit <- randomForest(
+  shot_made_flag ~ shot_distance + loc_x + loc_y +
+    minutes_remaining + seconds_remaining +
+    period + playoffs + shot_type + combined_shot_type +
+    shot_zone_basic + clutch,
+  data = train_data_scaled,
+  ntree = 500,         # stabilises results
+  mtry = 3,            # number of predictors tried per split 
+  importance = TRUE
+)
+
+#Predict probabilities (supports ROC/AUC)
+rf_prob <- predict(rf_fit, newdata = test_data_scaled, type = "prob")[, "Made"]
+
+# probabilities should vary (if it is almost constant, the model isn't learning much)
+summary(rf_prob)
+
+# Default 0.5 classification + confusion matrix (threshold-based performance) 
+rf_pred_05 <- factor(ifelse(rf_prob >= 0.5, "Made", "Miss"),
+                     levels = levels(test_data_scaled$shot_made_flag))
+
+cm_rf_05 <- confusionMatrix(rf_pred_05, test_data_scaled$shot_made_flag, positive = "Made")
+cm_rf_05
+
+# Make sure factor has the right order: controls first, then cases
+test_y <- factor(test_data_scaled$shot_made_flag, levels = c("Miss", "Made"))
+
+rf_roc <- rf_roc <- pROC::roc(
+  response  = test_data_scaled$shot_made_flag,
+  predictor = rf_prob,
+  levels    = c("Miss","Made"),
+  direction = "<",
+  quiet     = TRUE)
+
+auc_rf <- as.numeric(auc(rf_roc))
+auc_rf
+# Plot ROC curve
+plot(rf_roc,
+col = "black",
+lwd = 2,
+main = "ROC Curve – Random Forest",
+legacy.axes = TRUE,
+xlab = "False Positive Rate (1 − Specificity)",
+ylab = "True Positive Rate (Sensitivity)")
+
+
+# Add random-classifier reference line
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+# Annotate AUC in bottom-right quadrant
+text(
+  x = 0.65,
+  y = 0.25,
+  labels = paste0("AUC =  0.607",
+  cex = 0.9
+))
+
+
+# choose an "optimal" threshold (Youden’s J) and re-score
+opt_rf <- coords(rf_roc, x = "best", best.method = "youden",
+                 ret = c("threshold", "sensitivity", "specificity"),
+                 transpose = FALSE)
+opt_rf
+
+t_rf <- as.numeric(opt_rf["threshold"])
+
+rf_pred_opt <- factor(ifelse(rf_prob >= t_rf, "Made", "Miss"),
+                      levels = levels(test_data_scaled$shot_made_flag))
+
+cm_rf_opt <- confusionMatrix(rf_pred_opt, test_data_scaled$shot_made_flag, positive = "Made")
+cm_rf_opt
+
+# Variable importance plot
+varImpPlot(rf_fit, type = 2, main = "Random Forest Variable Importance (MeanDecreaseGini)")
+
+
+```
+#SVM (Radial)
+```{r}
+set.seed(123)
+
+#Fit Radial SVM
+svm_radial_fit <- svm(
+  shot_made_flag ~ shot_distance + loc_x + loc_y +
+    minutes_remaining + seconds_remaining +
+    period + playoffs + shot_type +
+    combined_shot_type + shot_zone_basic + clutch,
+  data = train_data_scaled,
+  kernel = "radial",      # radial kernel (RBF)
+  cost = 1,               # baseline (tune later if you want)
+  gamma = 1/ncol(train_data_scaled) , # simple default-ish choice
+  probability = TRUE
+)
+
+#Predict on test set (keep probability output)
+svm_radial_pred <- predict(svm_radial_fit, newdata = test_data_scaled, probability = TRUE)
+
+# Extract P(Made) (must match factor level name exactly)
+svm_radial_prob <- attr(svm_radial_pred, "probabilities")[, "Made"]
+
+#Classify with 0.5 threshold (baseline)
+svm_radial_class <- factor(
+  ifelse(svm_radial_prob >= 0.5, "Made", "Miss"),
+  levels = levels(test_data_scaled$shot_made_flag) # keeps same order as truth
+)
+
+# Confusion matrix
+cm_svm_radial <- confusionMatrix(
+  svm_radial_class,
+  test_data_scaled$shot_made_flag,
+  positive = "Made"
+)
+cm_svm_radial
+
+# ROC + AUC (use legacy.axes so x-axis is FPR from 0 -> 1)
+svm_radial_roc <- roc(
+  response  = test_data_scaled$shot_made_flag,
+  predictor = svm_radial_prob,
+  levels    = c("Miss", "Made"),  # negative then positive
+  direction = "<"                 # higher prob = more likely "Made"
+)
+
+svm_radial_auc <- as.numeric(auc(svm_radial_roc))
+svm_radial_auc
+
+#  ROC plot 
+plot(
+svm_radial_roc,
+col = "black", lwd = 2,
+legacy.axes = TRUE,
+main = "ROC Curve – SVM (Radial)",
+xlab = "False Positive Rate (1 − Specificity)",
+ylab = "True Positive Rate (Sensitivity)")
+
+abline(a = 0, b = 1, lty = 2, col = "darkgray") # random baseline
+
+text(
+x = 0.65, y = 0.25,
+labels = paste0("AUC = ", round(svm_radial_auc, 3)),
+cex = 0.9)
+
+```
+
+#Deep Learning
+```{r}
+set.seed(123)
+
+# Start H2O (cap memory if you want)
+h2o.init(nthreads = -1, max_mem_size = "2G")
+h2o.no_progress()  # cleaner knitting
+
+# Remove leakage cols if they exist 
+train_dl <- train_data_scaled
+test_dl  <- test_data_scaled
+train_dl$made01 <- NULL
+test_dl$made01  <- NULL
+
+# Convert to H2O frames
+train_h2o <- as.h2o(train_dl)
+test_h2o  <- as.h2o(test_dl)
+
+# Ensure classification target
+train_h2o$shot_made_flag <- as.factor(train_h2o$shot_made_flag)
+test_h2o$shot_made_flag  <- as.factor(test_h2o$shot_made_flag)
+
+y <- "shot_made_flag"                      # response
+x <- setdiff(names(train_h2o), y)          # predictors only
+
+# Deep learning model (with dropout to reduce overfit)
+dl_fit <- h2o.deeplearning(
+x = x, y = y,
+training_frame = train_h2o,
+activation = "RectifierWithDropout",     # ReLU + dropout
+hidden = c(128, 64, 32),                 # 3 hidden layers
+input_dropout_ratio = 0.1,               # dropout on inputs
+hidden_dropout_ratios = c(0.3, 0.3, 0.3),# dropout per layer
+epochs = 50,                             # training passes
+standardize = FALSE,                     # already scaled numeric vars
+seed = 123)
+
+# Predict on test set (probabilities)
+dl_pred <- h2o.predict(dl_fit, test_h2o)
+dl_pred_df <- as.data.frame(dl_pred)
+
+# Extract P(Made) (check names if this errors)
+# names(dl_pred_df)
+dl_prob <- dl_pred_df$Made
+
+# Confusion matrix at 0.5 threshold
+dl_class <- factor(ifelse(dl_prob >= 0.5, "Made", "Miss"),
+levels = levels(test_data_scaled$shot_made_flag))
+
+dl_cm <- confusionMatrix(dl_class, test_data_scaled$shot_made_flag, positive = "Made")
+
+# AUC using H2O (recommended)
+dl_perf <- h2o.performance(dl_fit, newdata = test_h2o)
+h2o.auc(dl_perf)
+
+# ROC + AUC using pROC (nice plot)
+dl_roc <- pROC::roc(
+response  = test_data_scaled$shot_made_flag,
+predictor = dl_prob,
+levels    = c("Miss", "Made"),
+direction = "<"                          # higher prob = "Made"
+)
+
+dl_auc <- as.numeric(pROC::auc(dl_roc))
+dl_auc
+
+plot(dl_roc, col="red", lwd=2, legacy.axes=TRUE,
+main=paste0("ROC Curve - H2O Deep Learning (AUC = ", round(dl_auc, 3), ")"),
+xlab="False Positive Rate", ylab="True Positive Rate")
+abline(a=0, b=1, lty=2, col="gray")
+
+# Store results neatly
+dl_results <- data.frame(
+Model       = "Deep Learning (H2O)",
+Accuracy    = dl_cm$overall["Accuracy"],
+Sensitivity = dl_cm$byClass["Sensitivity"],
+Specificity = dl_cm$byClass["Specificity"],
+AUC         = dl_auc)
+dl_results
+
+# Variable importance
+h2o.varimp(dl_fit)
+h2o.varimp_plot(dl_fit)
+
+
+```
+
+#Comparison
+```{r}
+# Consistent evaluator: takes probs (P(Made)) + returns cm, AUC, roc
+eval_probs <- function(probs, truth, positive = "Made", threshold = 0.5, model_name = "Model") {
+
+truth <- factor(truth, levels = c("Miss", "Made"))  # consistent ordering
+
+preds <- factor(ifelse(probs >= threshold, positive, "Miss"),
+                  levels = levels(truth))
+
+cm <- caret::confusionMatrix(preds, truth, positive = positive)
+
+roc_o <- pROC::roc(truth, probs,
+levels = c("Miss", "Made"),
+direction = "<",
+quiet = TRUE)
+
+list(model = model_name, cm = cm, AUC = as.numeric(pROC::auc(roc_o)), roc = roc_o)}
+
+# GLM: predict gives probabilities directly
+p_glm <- function(fit, test) predict(fit, newdata = test, type = "response")
+
+# Random Forest: type="prob" then take "Made" column
+p_rf  <- function(fit, test) predict(fit, newdata = test, type = "prob")[, "Made"]
+
+# SVM (e1071): probs are stored in attr(...)
+p_svm <- function(fit, test) {
+pr <- predict(fit, newdata = test, probability = TRUE)
+attr(pr, "probabilities")[, "Made"]}
+
+# H2O DL: h2o.predict returns a frame with columns incl. "Made"
+p_dl  <- function(fit, test) {
+pr <- h2o.predict(fit, as.h2o(test))
+as.data.frame(pr)$Made}
+
+glm_res <- eval_probs(p_glm(glm_fit, test_data_scaled), test_data_scaled$shot_made_flag,
+model_name = "Logistic Regression")
+rf_res  <- eval_probs(p_rf(rf_fit, test_data_scaled), test_data_scaled$shot_made_flag,
+model_name = "Random Forest")
+svm_res <- eval_probs(p_svm(svm_radial_fit, test_data_scaled), test_data_scaled$shot_made_flag,
+model_name = "SVM (Radial)")
+dl_res  <- eval_probs(p_dl(dl_fit, test_data_scaled), test_data_scaled$shot_made_flag,
+model_name = "Deep Learning (H2O)")
+
+get_metrics <- function(res) 
+{c(Accuracy    = as.numeric(res$cm$overall["Accuracy"]),
+Sensitivity = as.numeric(res$cm$byClass["Sensitivity"]),
+Specificity = as.numeric(res$cm$byClass["Specificity"]),
+AUC         = as.numeric(res$AUC))}
+
+test_summary <- tibble(
+Model = c(glm_res$model, rf_res$model, svm_res$model, dl_res$model),
+rbind(
+get_metrics(glm_res),
+get_metrics(rf_res),
+get_metrics(svm_res),
+get_metrics(dl_res))) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+test_summary
+
+plot(glm_res$roc, col="blue", lwd=2, legacy.axes=TRUE, main="ROC Curves (Test Set)")
+lines(rf_res$roc,  col="green",  lwd=2)
+lines(svm_res$roc, col="red",    lwd=2)
+lines(dl_res$roc,  col="black",  lwd=2)
+
+legend("bottomright",
+legend=c("GLM","RF","SVM","DL"),
+col=c("blue","green","red","black"),
+lwd=2)
+
+
+```
+
